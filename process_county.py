@@ -261,136 +261,138 @@ def find_tile_ids(county_shp: str) -> list[str]:
     return []
 
 
+def merge_tile_csvs_incremental(tile_csvs, csv_final, chunksize=5000):
+
+    os.makedirs(os.path.dirname(csv_final), exist_ok=True)
+    header_written = False
+
+    with open(csv_final, 'w', encoding='utf-8-sig', newline='') as fout:
+        for csvp in tile_csvs:
+            print(f"合并中：{csvp}")
+            # 按块读取，避免一次性全部载入
+            for chunk in pd.read_csv(csvp, dtype={"xy_id": str}, chunksize=chunksize):
+                chunk.to_csv(
+                    fout,
+                    index=False,
+                    header=not header_written,
+                    encoding='utf-8-sig'
+                )
+                header_written = True
+    print(f"✓ 已写入最终 CSV：{csv_final}")
+
+
+
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import logging, shutil, arcpy     # 其余 import 与原来相同
 
 def process_one_county(code: str) -> None:
     tmp_dir       = Path(ROOT, code)
     fishnet_final = Path(FISHNET_DIR, f"{code}.shp")
     csv_final     = Path(CSV_DIR,     f"{code}.csv")
-    
-    Success = False
+
+    success = False                 # 用小写，更符合 PEP8
 
     try:
         tmp_dir.mkdir(exist_ok=True)
 
+        # ---------- 0. 县界 ----------
         county_shp = tmp_dir / f"{code}.shp"
         if not export_county_polygon(code, str(county_shp)):
             return
 
+        # ---------- 1. 找 tile ----------
         tile_ids = find_tile_ids(str(county_shp))
         if not tile_ids:
             logging.warning(f"[{code}] No tile found – skipped")
             return
         logging.info(f"[{code}] Tiles: {tile_ids}")
 
-        tile_fishnets = []
-        tile_csvs     = []
+        tile_fishnets, tile_csvs = [], []     # 用来收集“确实生成成功”的文件
 
-        tile_list = tile_ids         
+        # ---------- 2. 并行裁剪 ----------
+        with ProcessPoolExecutor(max_workers=4) as ex:
+            fut2tid = {
+                ex.submit(process_one_tile, tid, str(county_shp),
+                          tmp_dir / f"tile_{tid}"): tid
+                for tid in tile_ids
+            }
 
-        for tid in tile_list:
-            logging.info(f"[{code}] >>> Tile {tid} start")
-            sub_dir  = tmp_dir / f"tile_{tid}"
-            clip_dir = sub_dir / "clip"
-            dbf_dir  = sub_dir / "dbf"
-            clip_dir.mkdir(parents=True, exist_ok=True)
-            dbf_dir.mkdir(exist_ok=True)
+            for fut in as_completed(fut2tid):
+                tid = fut2tid[fut]
+                try:
+                    res = fut.result()        # res 期望返回 (fishnet, csv) 或 None
+                    if not res:
+                        logging.warning(f"[{code}] Tile {tid} skipped by worker")
+                        continue
 
-            # ---------- 3.1 并行裁剪 ----------
-            # ① 列出所有 hdf 文件（按你的 RAW_VIIRS_ROOT 规则来）
-            h5_paths = sorted(Path(RAW_VIIRS_ROOT).rglob(f"*{tid}*.h*"))
+                    fishnet_tile, csv_tile = map(Path, res)
+                    if fishnet_tile.exists():
+                        tile_fishnets.append(str(fishnet_tile))
+                    else:
+                        logging.warning(f"[{code}] {fishnet_tile} missing – ignored")
 
-            # ② 已有 tif 就跳过
-            existing_tif = any((clip_dir / f"{p.stem}_clip_filtered.tif").exists()
-                               for p in h5_paths)
-            if existing_tif:
-                logging.info(f"[{tid}] 检测到已有 tif，跳过转换")
-            else:
-                logging.info(f"[{tid}] {len(h5_paths)} HDF 待转换（多进程…）")
+                    if csv_tile.exists():
+                        tile_csvs.append(str(csv_tile))
+                    else:
+                        logging.warning(f"[{code}] {csv_tile} missing – ignored")
 
-                with ProcessPoolExecutor(max_workers=4) as ex:
-                    futures = {}
-                    for tid in tile_ids:
-                        sub_dir = tmp_dir / f"tile_{tid}"
-                        fut = ex.submit(process_one_tile, tid, str(county_shp), sub_dir)
-                        futures[fut] = tid
-
-                    for fut in as_completed(futures):
-                        tid = futures[fut]
-                        try:
-                            res = fut.result()
-                            if res is None:
-                                logging.warning(f"[{code}] Tile {tid} skipped")
-                                continue
-                            fishnet_tile, csv_tile = res
-                            tile_fishnets.append(str(fishnet_tile))
-                            tile_csvs.append(str(csv_tile))
-                        except Exception as e:
-                            logging.exception(f"[{code}] Tile {tid} failed: {e}")
-
-            # ---------- 3.2 以后维持串行 ----------
-            sample_raster = find_sample_raster(str(clip_dir))
-            if sample_raster is None:
-                logging.warning(f"[{code}] Tile {tid} produced no raster – skipped")
-                continue
-
-            fishnet_tile = sub_dir / f"fishnet_{tid}.shp"
-            build_shp_grid(sample_raster, str(fishnet_tile))
-
-            dbf_dir = sub_dir / "dbf"         # 别忘了先定义
-            dbf_dir.mkdir(exist_ok=True)
-
-            run_zonal_statistics(str(clip_dir), str(fishnet_tile), str(dbf_dir))
-
-            csv_tile = sub_dir / f"csv_{tid}.csv"
-            merge_dbf_tables(str(dbf_dir), str(csv_tile), delete_dbf=False)
-
-            tile_fishnets.append(str(fishnet_tile))
-            tile_csvs.append(str(csv_tile))
+                except Exception as e:
+                    logging.exception(f"[{code}] Tile {tid} failed: {e}")
 
 
+
+        # ---------- 4. 合并 ----------
         if not tile_fishnets:
-            logging.warning(f"[{code}] No tile succeeded – skipped")
+            logging.warning(f"[{code}] No valid fishnets – skipped")
+            return                      # 没有任何 shp，就没有继续的必要
+
+        # 4.1 Fishnet 合并
+        try:
+            if fishnet_final.exists():
+                arcpy.Delete_management(str(fishnet_final))
+            if len(tile_fishnets) == 1:
+                arcpy.management.CopyFeatures(tile_fishnets[0], str(fishnet_final))
+            else:
+                arcpy.management.Merge(tile_fishnets, str(fishnet_final))
+        except Exception as e:
+            logging.exception(f"[{code}] Merge fishnet failed: {e}")
             return
 
-        # 合并所有 tile 的 fishnet，生成最终 county fishnet
-        if fishnet_final.exists():
-            arcpy.Delete_management(str(fishnet_final))
-        if len(tile_fishnets) == 1:
-            arcpy.management.CopyFeatures(tile_fishnets[0], str(fishnet_final))
-        else:
-            arcpy.management.Merge(tile_fishnets, str(fishnet_final))
+        # 4.2 CSV 合并 —— **再次只取真的存在的文件**
+        valid_csvs = [c for c in tile_csvs if Path(c).exists()]
+        if not valid_csvs:
+            logging.warning(f"[{code}] No CSV produced – skipped")
+            return
+        try:
+            merge_tile_csvs_incremental(valid_csvs, csv_final)
+        except Exception as e:
+            logging.exception(f"[{code}] Merge CSV failed: {e}")
+            return
 
-        # 合并所有 tile 的 CSV，生成最终 county CSV
-        dfs = []
-        for csvp in tile_csvs:
-            df  = pd.read_csv(csvp, dtype={"xy_id": str})
-            dfs.append(df)
-
-        final_df = pd.concat(dfs, axis=0, ignore_index=True)
-        final_df.to_csv(csv_final, index=False, encoding="utf-8-sig")
-
-        logging.info(f"[{code}] Completed successfully with {len(tile_fishnets)} tiles")
-        Success = True
+        logging.info(f"[{code}] Completed successfully with {len(valid_csvs)} tiles")
+        success = True
         mark_done(code)
 
     except Exception as e:
         logging.exception(f"[{code}] FAILED: {e}")
 
     finally:
+        # 清理或保留临时目录
         try:
             arcpy.ClearWorkspaceCache_management()
         except Exception:
             pass
 
-        if Success == True:
+        if success:
             try:
-                if tmp_dir.exists():
-                    shutil.rmtree(tmp_dir)
-                    logging.info(f"[{code}] Temp folder deleted.")
+                shutil.rmtree(tmp_dir)
+                logging.info(f"[{code}] Temp folder deleted.")
             except Exception as cleanup_err:
                 logging.warning(f"[{code}] !! Failed to delete temp folder: {cleanup_err}")
+        else:
+            logging.warning(f"[{code}] Kept temp folder for debug.")
 
-        else: logging.warning(f"Keep [{code}] folder for debug!")
             
 
 def main() -> None:
