@@ -266,6 +266,12 @@ def merge_tile_csvs_incremental(tile_csvs, csv_final, chunksize=5000):
     os.makedirs(os.path.dirname(csv_final), exist_ok=True)
     header_written = False
 
+    if len(tile_csvs) == 1:
+        os.makedirs(os.path.dirname(csv_final), exist_ok=True)
+        shutil.copy(tile_csvs[0], csv_final)
+        print(f"✓ 只有一个文件，已复制：{tile_csvs[0]} → {csv_final}")
+        return
+
     with open(csv_final, 'w', encoding='utf-8-sig', newline='') as fout:
         for csvp in tile_csvs:
             print(f"合并中：{csvp}")
@@ -308,7 +314,7 @@ def process_one_county(code: str) -> None:
             return
         logging.info(f"[{code}] Tiles: {tile_ids}")
 
-        tile_fishnets, tile_csvs = [], []     # 用来收集“确实生成成功”的文件
+        tile_fishnets, tile_csvs = [], []     
 
         # ---------- 2. 并行裁剪 ----------
         with ProcessPoolExecutor(max_workers=4) as ex:
