@@ -21,6 +21,8 @@ RAW_VIIRS_ROOT  = r"F:\数据\Flood_lighting\California"
 COUNTY_CSV      = r"E:\OneDrive - National University of Singapore\研二下\Flooding\ca_counties.csv"
 COUNTY_SHP      = r"E:\National University of Singapore\Yang Yang - flooding\Raw Data\SHP\selectedCounty.shp"
 TILE_SHP        = r"E:\National University of Singapore\Yang Yang - flooding\Raw Data\SHP\BlackMarbleTiles.shp"
+DATE_RANGE_CSV = r"E:\OneDrive - National University of Singapore\研二下\Flooding\county_extraction_date_ranges.csv"
+
 
 FISHNET_DIR     = os.path.join(ROOT, "fishnet")
 CSV_DIR         = os.path.join(ROOT, "lighting_csv")
@@ -62,7 +64,17 @@ def mark_done(code: str) -> None:
 
 
 
-def process_one_tile(tid: str, county_shp: str, sub_dir: Path):
+_df_rng = (
+    pd.read_csv(DATE_RANGE_CSV, dtype=str, parse_dates=["startDate", "endDate"])
+      .assign(countyCode=lambda d: d["countyCode"].str.zfill(5))
+)
+DATE_RANGES = (
+    _df_rng.groupby("countyCode")
+           .apply(lambda g: list(zip(g["startDate"].dt.date, g["endDate"].dt.date)))
+           .to_dict()
+)
+
+def process_one_tile(tid: str, county_shp: str, sub_dir: Path,date_ranges=None):
     """
     把原来 for tid in tile_list: 里的 3.1~3.3 全放进来
     注意不要再扫描父目录；直接用 sub_dir / "clip"
@@ -77,7 +89,8 @@ def process_one_tile(tid: str, county_shp: str, sub_dir: Path):
         input_folder  = RAW_VIIRS_ROOT,  # 让它自己扫所有 HDF
         output_folder = str(clip_dir),
         cutline_shp   = county_shp,
-        tile_filter   = tid,             # 只过滤该 tile
+        tile_filter   = tid,
+        date_ranges   = date_ranges,
         dst_nodata    = -9999,
         overwrite     = False
     )
@@ -317,10 +330,15 @@ def process_one_county(code: str) -> None:
         tile_fishnets, tile_csvs = [], []     
 
         # ---------- 2. 并行裁剪 ----------
+        date_ranges = DATE_RANGES.get(code.zfill(5))
         with ProcessPoolExecutor(max_workers=4) as ex:
+
             fut2tid = {
-                ex.submit(process_one_tile, tid, str(county_shp),
-                          tmp_dir / f"tile_{tid}"): tid
+                ex.submit(
+                    process_one_tile, tid, str(county_shp),
+                    tmp_dir / f"tile_{tid}",                
+                    date_ranges                             
+                ): tid
                 for tid in tile_ids
             }
 

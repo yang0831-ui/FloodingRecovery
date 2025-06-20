@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import List, Optional
 from osgeo import gdal, ogr
 import numpy as np
+import datetime as _dt
 gdal.SetConfigOption("GDAL_NUM_THREADS", "ALL_CPUS")
 gdal.SetConfigOption("GDAL_CACHEMAX", "4096")   
 gdal.PushErrorHandler("CPLQuietErrorHandler")
@@ -41,6 +42,7 @@ def viirs_hdf_to_clipped_tif(
     cutline_shp: str,
     *,
     tile_filter: Optional[str] = None,
+    date_ranges: Optional[list[tuple]] = None,
     dst_nodata: float = -9999.0,
     overwrite: bool = False,
 ) -> List[str]:
@@ -56,6 +58,15 @@ def viirs_hdf_to_clipped_tif(
     for h5_path in sorted(in_dir.rglob("*.h*")):
         if tile_filter and tile_filter not in h5_path.name:
             continue
+            # --- 新增：日期过滤 ---
+        if date_ranges:
+            m = re.search(r"\.A(\d{4})(\d{3})\.", h5_path.name)
+            if not m:
+                continue                      # 文件名不合规直接跳过
+            dt = _dt.datetime.strptime(m.group(1) + m.group(2), "%Y%j").date()
+            # 只要落在任一日期段内即可
+            if not any(start <= dt <= end for start, end in date_ranges):
+                continue
 
         out_tif = out_dir / f"{h5_path.stem}_clip_filtered.tif"
         if out_tif.exists():
